@@ -83,9 +83,9 @@ create table public.books (
   class_id      uuid not null references public.classes(id) on delete cascade,
   slug          char(6) not null unique check (slug ~ '^[A-HJ-NP-Z2-9a-hj-np-z]{6}$'),
   pen_name      text not null check (length(btrim(pen_name)) between 1 and 40),
-  title         text,
-  intro         text,                                       -- 한 줄 작가 소개 (선택)
-  data          jsonb not null,
+  title         text check (title is null or char_length(title) <= 80),
+  intro         text check (intro is null or char_length(intro) <= 80),  -- 한 줄 작가 소개 (선택)
+  data          jsonb not null check (jsonb_typeof(data) = 'object' and octet_length(data::text) <= 524288),
   storage_paths text[] not null default '{}',
   created_at    timestamptz not null default now(),
   updated_at    timestamptz not null default now()
@@ -186,6 +186,9 @@ grant execute on function public.view_class_books(char, text) to anon, authentic
 -- 6) RPC 2: 학생 업로드 (upload_code 매칭 + 잠금 체크 + INSERT)
 -- ─────────────────────────────────────────────────────────────────
 
+-- 검증 순서가 중요합니다. 학급(upload_code) 매칭은 가장 마지막에 합니다.
+-- 그래야 placeholder 필명·잘못된 데이터 등을 보내도 "코드가 유효한지"가 노출되지 않습니다
+-- (P0003·P0006~P0010이 코드 유효성 oracle이 되는 것을 차단).
 create or replace function public.upload_book(
   p_upload_code char(6),
   p_school_year text,
@@ -204,12 +207,78 @@ declare
   v_class       public.classes%rowtype;
   v_now         timestamptz := now();
   v_pen         text := btrim(p_pen_name);
+  v_title       text := nullif(btrim(p_title), '');
+  v_intro       text := nullif(btrim(p_intro), '');
+  v_data        jsonb := p_data;
   v_slug        char(6);
   v_alphabet    text := '23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ';
   v_attempt     int := 0;
   v_inserted    boolean := false;
+  v_storage_prefix text := 'https://ipjdoabdjuuieuojvryl.supabase.co/storage/v1/object/public/book-images/';
+  v_page        jsonb;
+  v_drawing     text;
+  v_name_in     text;
 begin
-  -- 학급 매칭
+  -- ① 필명 검증 (학급 매칭 전 — placeholder가 코드 유효성 oracle이 되지 않도록)
+  if v_pen is null or v_pen = '' or char_length(v_pen) > 40
+     or v_pen ~* '^(학생|이름|작가|name|student|test)$' then
+    raise exception '필명을 사용해 주세요 (실명·placeholder 금지, 40자 이내)' using errcode = 'P0003';
+  end if;
+
+  -- ② 데이터 형식·크기·길이 서버 측 검증 (클라이언트 검증 우회 방지)
+  if v_data is null or jsonb_typeof(v_data) <> 'object' then
+    raise exception '책 데이터가 비어 있거나 형식이 잘못됐어요' using errcode = 'P0006';
+  end if;
+  if octet_length(v_data::text) > 524288 then  -- 512KB
+    raise exception '책 데이터가 너무 커요 (최대 512KB). 이미지 화질을 낮춰보세요' using errcode = 'P0006';
+  end if;
+  if jsonb_typeof(v_data->'pages') <> 'array' or jsonb_array_length(v_data->'pages') = 0 then
+    raise exception '페이지 정보가 없어요' using errcode = 'P0007';
+  end if;
+  if jsonb_array_length(v_data->'pages') > 30 then
+    raise exception '페이지가 너무 많아요 (최대 30장)' using errcode = 'P0007';
+  end if;
+  if v_title is not null and char_length(v_title) > 80 then
+    raise exception '제목이 너무 길어요 (최대 80자)' using errcode = 'P0008';
+  end if;
+  if v_intro is not null and char_length(v_intro) > 80 then
+    raise exception '작가 소개가 너무 길어요 (최대 80자)' using errcode = 'P0008';
+  end if;
+
+  -- ③ 책 데이터 안의 개인정보 정리
+  --   - student.class(반 번호): 강제 제거
+  --   - student.name / author.name: pen_name과 다른 실명 의심값이면 거부, 그 외엔 pen_name으로 통일
+  v_data := v_data #- '{student,class}';
+
+  v_name_in := nullif(btrim(coalesce(v_data->'student'->>'name', '')), '');
+  if v_name_in is not null and lower(v_name_in) <> lower(v_pen) and v_name_in !~* '^(작가|학생)$' then
+    raise exception '작품 안에 실명으로 보이는 이름(%)이 들어 있어요. picturebook-storyboard에서 이름 칸을 필명("%")으로 바꾼 뒤 다시 올려주세요',
+      v_name_in, v_pen using errcode = 'P0010';
+  end if;
+  v_name_in := nullif(btrim(coalesce(v_data->'author'->>'name', '')), '');
+  if v_name_in is not null and lower(v_name_in) <> lower(v_pen) and v_name_in !~* '^(작가|학생)$' then
+    raise exception '작품의 작가 정보에 실명으로 보이는 이름(%)이 들어 있어요. 필명("%")으로 바꿔주세요',
+      v_name_in, v_pen using errcode = 'P0010';
+  end if;
+  if jsonb_typeof(v_data->'student') = 'object' then
+    v_data := jsonb_set(v_data, '{student,name}', to_jsonb(v_pen));
+  end if;
+  if jsonb_typeof(v_data->'author') = 'object' then
+    v_data := jsonb_set(v_data, '{author,name}', to_jsonb(v_pen));
+  end if;
+
+  -- ④ pages[*].drawing은 우리 Storage URL 또는 data: URI만 허용 (외부 추적 픽셀 차단)
+  for v_page in select * from jsonb_array_elements(v_data->'pages')
+  loop
+    v_drawing := v_page->>'drawing';
+    if v_drawing is not null and length(v_drawing) > 0
+       and v_drawing not like v_storage_prefix || '%'
+       and v_drawing not like 'data:image/%' then
+      raise exception '작품 안의 이미지 주소가 허용되지 않은 외부 URL입니다' using errcode = 'P0009';
+    end if;
+  end loop;
+
+  -- ⑤ 학급 매칭 (가장 마지막 — 위 검증을 다 통과해야 코드 유효성 정보가 노출됨)
   select * into v_class
     from public.classes
    where upload_code  = p_upload_code
@@ -217,21 +286,15 @@ begin
    limit 1;
 
   if not found then
-    -- 잠금 카운트 누적할 학급이 없으므로 즉시 거부 (특정 에러)
     raise exception '업로드 코드가 맞지 않아요' using errcode = 'P0001';
   end if;
 
-  -- 잠금 상태 확인
+  -- ⑥ 잠금 상태 확인
   if v_class.upload_locked is not null and v_class.upload_locked > v_now then
     raise exception '업로드 코드가 일시 잠겼습니다. 잠시 후 다시 시도해 주세요' using errcode = 'P0002';
   end if;
 
-  -- 필명 검증 (placeholder 거부)
-  if v_pen is null or v_pen = '' or v_pen ~* '^(학생|이름|작가|name|student|test)$' then
-    raise exception '필명을 사용해 주세요 (실명·placeholder 금지)' using errcode = 'P0003';
-  end if;
-
-  -- 슬러그 6자리 충돌 재시도 (최대 5회)
+  -- ⑦ 슬러그 6자리 충돌 재시도 (최대 5회)
   while v_attempt < 5 and not v_inserted loop
     v_slug := '';
     for i in 1..6 loop
@@ -242,8 +305,8 @@ begin
       insert into public.books
         (class_id, slug, pen_name, title, intro, data, storage_paths)
       values
-        (v_class.id, v_slug, v_pen, nullif(btrim(p_title),''), nullif(btrim(p_intro),''),
-         p_data, coalesce(p_storage_paths, '{}'::text[]));
+        (v_class.id, v_slug, v_pen, v_title, v_intro,
+         v_data, coalesce(p_storage_paths, '{}'::text[]));
       v_inserted := true;
     exception when unique_violation then
       v_attempt := v_attempt + 1;
@@ -254,7 +317,7 @@ begin
     raise exception '잠시 후 다시 시도해 주세요' using errcode = 'P0004';
   end if;
 
-  -- 성공 — 잠금 카운터 초기화
+  -- ⑧ 성공 — 잠금 카운터 초기화
   update public.classes
      set upload_failed = 0, upload_locked = null
    where id = v_class.id;

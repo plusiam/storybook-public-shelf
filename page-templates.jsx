@@ -14,8 +14,13 @@ const TYPE_LABELS = {
   author: '작가',
 };
 
+// 그림이 있는지 — base64 data URI 또는 우리 Storage 공개 URL 둘 다 인정
+// (업로드 시 extractAndUploadImages가 base64를 Storage URL로 교체하므로 둘 다 나옴)
+const PB_STORAGE_PREFIX = 'https://ipjdoabdjuuieuojvryl.supabase.co/storage/v1/object/public/book-images/';
 function hasDrawing(p) {
-  return typeof p?.drawing === 'string' && p.drawing.startsWith('data:image');
+  const d = p?.drawing;
+  if (typeof d !== 'string' || d.length === 0) return false;
+  return d.startsWith('data:image/') || d.startsWith(PB_STORAGE_PREFIX);
 }
 
 function normalizeBook(data) {

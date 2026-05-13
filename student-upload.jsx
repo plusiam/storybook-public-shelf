@@ -121,6 +121,11 @@ function StudentUpload() {
       setParsed(data);
       // JSON에 들어 있는 student.title이 있으면 자동 채움. 단 student.name은 자동 채우지 않음(실명일 가능성).
       if (!title && data?.student?.title) setTitle(data.student.title);
+      // 작품 안에 실명처럼 보이는 이름이 들어 있으면 미리 안내 (서버도 거부하지만 학생 친화 차원)
+      const inName = (data?.student?.name || data?.author?.name || '').trim();
+      if (inName && looksLikeRealName(inName)) {
+        setError(`작품 안에 "${inName}"이라는 이름이 들어 있어요. picturebook-storyboard에서 이름 칸을 별명으로 바꾼 뒤 다시 저장해 올려주세요. (그대로 올리면 거부됩니다)`);
+      }
     } catch (e) {
       setError(e?.message || '파일을 읽지 못했어요');
     }
@@ -159,7 +164,17 @@ function StudentUpload() {
       } else if (code === 'P0002') {
         setError('업로드 코드가 일시 잠겼어요. 선생님께 말씀드려 주세요.');
       } else if (code === 'P0003') {
-        setError('필명을 다시 입력해 주세요. 실명이나 "학생/이름" 같은 단어는 쓸 수 없어요.');
+        setError('필명을 다시 입력해 주세요. 실명이나 "학생/이름" 같은 단어는 쓸 수 없어요. (40자 이내)');
+      } else if (code === 'P0006') {
+        setError('책 데이터가 너무 크거나 형식이 잘못됐어요. 이미지 화질을 낮추거나 picturebook-storyboard에서 다시 저장해 주세요.');
+      } else if (code === 'P0007') {
+        setError('페이지 수가 맞지 않아요 (1~30장).');
+      } else if (code === 'P0008') {
+        setError('제목 또는 작가 소개가 너무 길어요 (각 80자 이내).');
+      } else if (code === 'P0009') {
+        setError('작품 안에 허용되지 않은 외부 이미지 주소가 들어 있어요. picturebook-storyboard에서 다시 저장한 JSON을 올려주세요.');
+      } else if (code === 'P0010') {
+        setError(msg); // 서버가 "실명으로 보이는 이름..." 같은 구체적 안내 메시지를 줌
       } else {
         setError(msg);
       }
